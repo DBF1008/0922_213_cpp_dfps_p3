@@ -15,6 +15,7 @@
  */
 
 #include "misc.h"
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -270,19 +271,30 @@ int ExecCmdSync(std::string *content, const char **argv) {
         return -1;
     }
 
+    // Drain the pipe before reaping the child.
+    // waitpid() must not be called first: when the child produces more output
+    // than the pipe buffer (~64KiB), it blocks on the write end while the
+    // parent blocks in waitpid(), and both sides hang forever. Reading keeps
+    // the child writable until it exits and closes the pipe (EOF).
     int status;
-    waitpid(pid, &status, 0);
-    status = WEXITSTATUS(status);
-
     if (content) {
         constexpr size_t READ_BATCH_SIZE = 4096;
         int len = 0;
         int l = 0;
         content->clear();
-        do {
+        while (true) {
             len += l;
             content->resize(len + READ_BATCH_SIZE);
-        } while ((l = read(fd, content->data() + len, READ_BATCH_SIZE)) > 0);
+            l = read(fd, content->data() + len, READ_BATCH_SIZE);
+            if (l > 0) {
+                continue;
+            }
+            if (l < 0 && errno == EINTR) {
+                l = 0;
+                continue;
+            }
+            break;
+        }
         close(fd);
 
         if (len > 0) {
@@ -292,6 +304,15 @@ int ExecCmdSync(std::string *content, const char **argv) {
             content->clear();
         }
     }
+
+    // Pipe is at EOF, so the child has exited (or is about to); it cannot be
+    // blocked on pipe writes anymore and waitpid() returns immediately.
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 
     return status;
 }
