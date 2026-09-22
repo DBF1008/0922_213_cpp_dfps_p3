@@ -15,6 +15,7 @@
  */
 
 #include "misc.h"
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
@@ -270,19 +271,23 @@ int ExecCmdSync(std::string *content, const char **argv) {
         return -1;
     }
 
-    int status;
-    waitpid(pid, &status, 0);
-    status = WEXITSTATUS(status);
-
+    // Drain the pipe while the child is still running. If we waited for the
+    // child first, a child writing more than the pipe buffer would block in
+    // write() while the parent blocks in waitpid(), deadlocking both sides.
     if (content) {
         constexpr size_t READ_BATCH_SIZE = 4096;
-        int len = 0;
-        int l = 0;
+        size_t len = 0;
+        ssize_t l = 0;
         content->clear();
         do {
-            len += l;
             content->resize(len + READ_BATCH_SIZE);
-        } while ((l = read(fd, content->data() + len, READ_BATCH_SIZE)) > 0);
+            do {
+                l = read(fd, content->data() + len, READ_BATCH_SIZE);
+            } while (l < 0 && errno == EINTR);
+            if (l > 0) {
+                len += l;
+            }
+        } while (l > 0);
         close(fd);
 
         if (len > 0) {
@@ -293,5 +298,8 @@ int ExecCmdSync(std::string *content, const char **argv) {
         }
     }
 
-    return status;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
